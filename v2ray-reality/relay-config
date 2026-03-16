@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ====== EDIT THESE ======
+GATEWAY_IP="80.69.174.17"
+PORTS=("443" "8443" "2083" "2443" "12443")
+WAN_IF="eth0"
+# ========================
+
+export DEBIAN_FRONTEND=noninteractive
+
+apt update -y
+apt install -y iptables-persistent netfilter-persistent ufw curl tcpdump
+
+# Enable IPv4 forwarding now + persist
+sysctl -w net.ipv4.ip_forward=1
+mkdir -p /etc/sysctl.d
+cat >/etc/sysctl.d/99-relay.conf <<'EOF'
+net.ipv4.ip_forward=1
+EOF
+sysctl --system >/dev/null
+
+# Clean existing relay rules
+iptables -t nat -F
+iptables -F FORWARD
+
+# Conservative default: allow forwarding we add explicitly
+iptables -P FORWARD DROP
+
+# DNAT + MASQUERADE + FORWARD rules for each service port
+for p in "${PORTS[@]}"; do
+  iptables -t nat -A PREROUTING -i "${WAN_IF}" -p tcp --dport "${p}" -j DNAT --to-destination "${GATEWAY_IP}:${p}"
+  iptables -A FORWARD -i "${WAN_IF}" -o "${WAN_IF}" -p tcp -d "${GATEWAY_IP}" --dport "${p}" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
+  iptables -A FORWARD -i "${WAN_IF}" -o "${WAN_IF}" -p tcp -s "${GATEWAY_IP}" --sport "${p}" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+done
+iptables -t nat -A POSTROUTING -o "${WAN_IF}" -p tcp -d "${GATEWAY_IP}" -j MASQUERADE
+
+# UFW: keep it simple on the relay
+ufw --force enable
+ufw allow 22/tcp
+for p in "${PORTS[@]}"; do
+  ufw allow "${p}/tcp"
+done
+
+# Persist firewall
+netfilter-persistent save
+systemctl enable netfilter-persistent >/dev/null 2>&1 || true
+
+# Quick visibility
+echo "=== ip_forward ==="
+sysctl net.ipv4.ip_forward
+echo "=== NAT rules ==="
+iptables -t nat -L -n -v
+echo "=== FORWARD rules ==="
+iptables -L FORWARD -n -v
+echo "=== UFW ==="
+ufw status verbose
+echo "=== Test gateway reachability ==="
+curl -skI --connect-timeout 5 "https://${GATEWAY_IP}" || true
+echo "Relay ready."
